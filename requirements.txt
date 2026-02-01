@@ -1,0 +1,7 @@
+google-genai
+chromadb
+pydantic
+python-dotenv
+sentence-transformers
+google-search-results
+fastmcp
