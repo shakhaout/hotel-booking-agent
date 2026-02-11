@@ -2,7 +2,7 @@ import asyncio
 import os
 import sys
 from contextlib import AsyncExitStack
-from typing import List, Optional, Any, Dict, Type
+from typing import List, Optional, Any, Dict
 
 from langchain_core.tools import StructuredTool
 from mcp import ClientSession, StdioServerParameters
@@ -11,109 +11,109 @@ from pydantic import create_model, Field
 
 class MCPClientManager:
     """
-    Manages the connection to a local MCP server and exposes its tools to LangChain.
+    Manages the lifecycle of the MCP Client connection and dynamically 
+    converts MCP tools into LangChain/GenAI compatible tools.
     """
     def __init__(self, server_script_path: str):
         self.server_script_path = server_script_path
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
 
-    async def start(self):
-        """Starts the MCP server subprocess and initializes the client session."""
+    async def connect(self):
+        """Establishes the stdio connection to the MCP server."""
+        # 1. Setup Environment
+        # Get the absolute path to the 'src' directory
+        server_dir = os.path.dirname(os.path.abspath(self.server_script_path))
+        # Get the Project Root (one level up from src)
+        project_root = os.path.dirname(server_dir)
+        
         env = os.environ.copy()
-        # Add the directory containing 'src' to PYTHONPATH to ensure imports work
-        # Assuming server.py is inside 'src/', so we need the parent of 'src/'
-        src_parent = os.path.dirname(os.path.dirname(os.path.abspath(self.server_script_path)))
-        python_path = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = f"{src_parent}{os.pathsep}{python_path}" if python_path else src_parent
+        # Add Project Root to PYTHONPATH so 'from src.tools...' works
+        if "PYTHONPATH" in env:
+            env["PYTHONPATH"] = project_root + os.pathsep + env["PYTHONPATH"]
+        else:
+            env["PYTHONPATH"] = project_root
 
+        # 2. Define Server Parameters
         server_params = StdioServerParameters(
             command=sys.executable,
             args=[self.server_script_path],
-            env=env,
+            env=env
         )
 
-        # Start the stdio client
+        # 3. Connect via Standard IO
         read, write = await self.exit_stack.enter_async_context(
             stdio_client(server_params)
         )
-        
-        # Initialize the session
         self.session = await self.exit_stack.enter_async_context(
             ClientSession(read, write)
         )
         
         await self.session.initialize()
+        print(f"✅ Connected to MCP Server")
 
-    async def stop(self):
-        """Stops the client session and the server subprocess."""
-        await self.exit_stack.aclose()
-        self.session = None
+    async def disconnect(self):
+        """Clean shutdown."""
+        try:
+            await self.exit_stack.aclose()
+        except RuntimeError:
+            # Ignore RuntimeError: Attempted to exit cancel scope... during shutdown
+            pass
+        print("🛑 Disconnected from MCP Server")
 
-    async def get_tools(self) -> List[StructuredTool]:
-        """Discovers tools from the MCP server and converts them to LangChain tools."""
+    async def get_langchain_tools(self) -> List[StructuredTool]:
+        """
+        Dynamically fetches MCP tools and converts them to LangChain StructuredTools.
+        """
         if not self.session:
-            raise RuntimeError("MCP Client not started. Call start() first.")
+            await self.connect()
 
-        result = await self.session.list_tools()
-        tools = []
+        mcp_list = await self.session.list_tools()
+        langchain_tools = []
 
-        for tool in result.tools:
-            tools.append(self._create_langchain_tool(tool))
+        for mcp_tool in mcp_list.tools:
+            # --- 1. Build Pydantic Model for Arguments ---
+            input_schema = mcp_tool.inputSchema
+            properties = input_schema.get("properties", {})
+            required = input_schema.get("required", [])
             
-        return tools
+            fields = {}
+            for name, prop in properties.items():
+                py_type = str 
+                t = prop.get("type")
+                if t == "integer": py_type = int
+                elif t == "number": py_type = float
+                elif t == "boolean": py_type = bool
+                elif t == "array": py_type = list
+                elif t == "object": py_type = dict
+                
+                desc = prop.get("description", "")
+                
+                if name in required:
+                    fields[name] = (py_type, Field(description=desc))
+                else:
+                    fields[name] = (Optional[py_type], Field(default=None, description=desc))
 
-    def _create_langchain_tool(self, mcp_tool) -> StructuredTool:
-        """Converts an MCP tool definition to a LangChain StructuredTool."""
-        # Create Pydantic model from inputSchema
-        schema = mcp_tool.inputSchema
-        properties = schema.get("properties", {})
-        required = schema.get("required", [])
-        
-        fields = {}
-        for name, prop in properties.items():
-            prop_type = Any
-            if prop.get("type") == "string":
-                prop_type = str
-            elif prop.get("type") == "integer":
-                prop_type = int
-            elif prop.get("type") == "boolean":
-                prop_type = bool
-            elif prop.get("type") == "number":
-                prop_type = float
-            
-            # Simple handling of defaults and required
-            if name in required:
-                fields[name] = (prop_type, Field(description=prop.get("description", "")))
-            else:
-                default_val = prop.get("default", None)
-                # If default is not None, use it. If it is None, make it Optional.
-                # However, for Pydantic v2, we should be careful.
-                # Let's use Optional for everything not required.
-                fields[name] = (Optional[prop_type], Field(default=default_val, description=prop.get("description", "")))
+            # Create the dynamic Pydantic model
+            ArgsModel = create_model(f"{mcp_tool.name}_args", **fields)
 
-        # Create the Pydantic model
-        args_schema = create_model(f"{mcp_tool.name}Schema", **fields)
+            # --- 2. Define Execution Logic ---
+            async def _executor(tool_name=mcp_tool.name, **kwargs):
+                if not self.session:
+                    raise RuntimeError("MCP Session disconnected")
+                
+                result = await self.session.call_tool(tool_name, arguments=kwargs)
+                text_content = [c.text for c in result.content if c.type == 'text']
+                return "\n".join(text_content)
 
-        async def _tool_func(**kwargs):
-            if not self.session:
-                raise RuntimeError("MCP Client is not connected.")
-            # Call the tool via MCP session
-            result = await self.session.call_tool(mcp_tool.name, arguments=kwargs)
-            
-            # Extract text content from the result
-            text_content = []
-            if result.content:
-                for item in result.content:
-                    if item.type == "text":
-                        text_content.append(item.text)
-            
-            return "\n".join(text_content)
+            # --- 3. Create LangChain Tool ---
+            tool = StructuredTool.from_function(
+                func=None,
+                coroutine=_executor,
+                name=mcp_tool.name,
+                description=mcp_tool.description,
+                args_schema=ArgsModel
+            )
+            langchain_tools.append(tool)
 
-        return StructuredTool.from_function(
-            func=None,
-            coroutine=_tool_func,
-            name=mcp_tool.name,
-            description=mcp_tool.description,
-            args_schema=args_schema,
-        )
+        return langchain_tools
