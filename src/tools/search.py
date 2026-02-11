@@ -1,4 +1,5 @@
 import os
+import sys
 from serpapi import GoogleSearch
 import json
 from typing import List, Dict, Any
@@ -32,9 +33,12 @@ class HotelSearchTool:
         if check_out:
             params["check_out_date"] = check_out
 
-        print(f"DEBUG: Searching hotels with query: {query}")
+        print(f"DEBUG: Searching hotels with query: {query}", file=sys.stderr)
         search = GoogleSearch(params)
         results = search.get_dict()
+        print(f"DEBUG: SerpApi Raw Results Keys: {results.keys()}", file=sys.stderr)
+        if "error" in results:
+             print(f"DEBUG: SerpApi Error: {results['error']}", file=sys.stderr)
         
         hotels = []
         if "properties" in results:

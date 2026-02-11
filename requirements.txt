@@ -6,3 +6,5 @@ sentence-transformers
 google-search-results
 fastmcp
 mcp
+langgraph
+langchain-google-genai
